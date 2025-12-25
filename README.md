@@ -38,7 +38,6 @@ Move it into your `PATH`:
 sudo mv tuirandr /usr/local/bin/
 ```
 
----
 
 ## Usage
 
