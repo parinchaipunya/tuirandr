@@ -1,4 +1,4 @@
-# tuirandr
+# tuiRandR
 A simple tui wrapper of `xrandr` with vim movements.
 It is especially suited for tiling window manager users (i3, bspwm, etc.) who want fast, scriptable display management without relying on a mouse.
 
