@@ -1,0 +1,466 @@
+#!/usr/bin/env python3
+import subprocess
+import shlex
+from typing import Dict, List, Tuple, Optional, Any
+
+from textual.app import App, ComposeResult
+from textual.containers import Horizontal, Vertical
+from textual.screen import ModalScreen
+from textual.widgets import Header, Footer, ListView, ListItem, Label, TextArea, Static, Button
+
+
+# ---------- xrandr helpers ----------
+
+def run(cmd: List[str]) -> str:
+    return subprocess.check_output(cmd, text=True)
+
+def parse_xrandr() -> Dict[str, dict]:
+    outputs: Dict[str, dict] = {}
+    current: Optional[dict] = None
+
+    for line in run(["xrandr", "--query"]).splitlines():
+        if " connected" in line or " disconnected" in line:
+            parts = line.split()
+            name = parts[0]
+            connected = ("connected" in parts)
+            current = {"connected": connected, "modes": [], "current": None}
+
+            if connected:
+                for p in parts:
+                    if "x" in p and "+" in p and p[0].isdigit():
+                        current["current"] = p.split("+")[0]
+                        break
+
+            outputs[name] = current
+            continue
+
+        if current and line.startswith(" "):
+            tok = line.split()
+            if tok and "x" in tok[0] and tok[0][0].isdigit():
+                current["modes"].append(tok[0])
+
+    return outputs
+
+def build_cmd(conf: Dict[str, dict], pos: Dict[str, Tuple[str, str]]) -> List[str]:
+    cmd: List[str] = ["xrandr"]
+
+    for out, c in conf.items():
+        if not c.get("enabled", False):
+            cmd += ["--output", out, "--off"]
+
+    for out, c in conf.items():
+        if not c.get("enabled", False):
+            continue
+
+        cmd += ["--output", out]
+        mode = c.get("mode")
+        if isinstance(mode, str) and mode:
+            cmd += ["--mode", mode]
+
+        if out in pos:
+            rel, ref = pos[out]
+            cmd += [f"--{rel}", ref]
+
+    return cmd
+
+
+# ---------- Quit confirmation modal (NO waiting) ----------
+
+class ConfirmQuit(ModalScreen):
+    CSS = """
+    ConfirmQuit { align: center middle; }
+    #dialog {
+        width: 60%;
+        max-width: 72;
+        border: heavy $panel;
+        padding: 1 2;
+        background: $surface;
+    }
+    #buttons { margin-top: 1; height: auto; }
+    #buttons Button { margin-right: 1; }
+    """
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="dialog"):
+            yield Static("[b]Quit?[/b]")
+            yield Static("You have unapplied changes. Quit anyway?")
+            with Horizontal(id="buttons"):
+                yield Button("Quit", id="yes", variant="error")
+                yield Button("Cancel", id="no", variant="primary")
+
+    def on_button_pressed(self, e: Button.Pressed) -> None:
+        if e.button.id == "yes":
+            self.app.exit()
+        else:
+            self.app.pop_screen()
+            notify = getattr(self.app, "notify", None)
+            if callable(notify):
+                try:
+                    notify("Quit cancelled", timeout=1.1)
+                except TypeError:
+                    notify("Quit cancelled")
+
+
+# ---------- TUI ----------
+
+class TuiRandr(App):
+    CSS = """
+    Screen { layout: vertical; }
+    #left  { width: 30%; border: tall $panel; padding: 1; }
+    #right { width: 70%; border: tall $panel; padding: 1; }
+    #cmd   { height: 6; border: tall $panel; }
+    #menu  { height: 12; border: tall $panel; }
+    """
+
+    BINDINGS = [
+        ("j", "down", "Down"),
+        ("k", "up", "Up"),
+        ("h", "focus_left", "Left"),
+        ("l", "focus_right", "Right"),
+
+        ("y", "apply_now", "Apply"),
+        ("enter", "apply_now", "Apply"),   # we override Enter when menu is open
+        ("q", "quit", "Quit"),
+
+        ("e", "toggle_enabled", "Toggle"),
+        ("m", "open_mode_menu", "Mode"),
+        ("p", "open_pos_menu", "Position"),
+        ("escape", "close_menu", "Back"),
+    ]
+
+    def __init__(self):
+        super().__init__()
+
+        self.outputs = parse_xrandr()
+        self.available = [o for o, d in self.outputs.items() if d["connected"]]
+
+        self.conf: Dict[str, Dict[str, Any]] = {
+            o: {"enabled": d["connected"], "mode": d["current"]}
+            for o, d in self.outputs.items()
+        }
+        self.pos: Dict[str, Tuple[str, str]] = {}
+
+        self.selected: Optional[str] = None
+        self.active_pane = "left"
+
+        # menu state
+        self.menu_kind: Optional[str] = None         # None | "mode" | "pos_rel" | "pos_ref"
+        self.pending_rel: Optional[str] = None
+        self.menu_items: List[str] = []
+
+        # dirty tracking
+        self._last_applied: Optional[Tuple[Tuple, Tuple]] = None
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        with Horizontal():
+            with Vertical(id="left"):
+                yield Label("Outputs (connected)")
+                yield ListView(id="outlist")
+
+            with Vertical(id="right"):
+                yield Static("", id="status")
+                yield Label("Menu")
+                yield ListView(id="menu")
+                yield Label("Command")
+                yield TextArea("", id="cmd", read_only=True)
+        yield Footer()
+
+    def on_mount(self):
+        out_lv = self.query_one("#outlist", ListView)
+        out_lv.clear()
+        for it in self.available:
+            out_lv.append(ListItem(Label(it)))
+        out_lv.index = 0 if self.available else None
+
+        if self.available:
+            self.selected = self.available[0]
+            self._mark_applied_snapshot()
+            self.refresh_right()
+            out_lv.focus()
+        else:
+            self.query_one("#cmd", TextArea).text = "No connected outputs detected."
+
+        self.query_one("#menu", ListView).display = False
+
+    # ---------- snapshots / dirty ----------
+
+    def _snapshot(self) -> Tuple[Tuple, Tuple]:
+        conf_snap = tuple(
+            sorted((o, bool(c.get("enabled", False)), c.get("mode")) for o, c in self.conf.items())
+        )
+        pos_snap = tuple(sorted((o, rel, ref) for o, (rel, ref) in self.pos.items()))
+        return conf_snap, pos_snap
+
+    def _mark_applied_snapshot(self) -> None:
+        self._last_applied = self._snapshot()
+
+    def _is_dirty(self) -> bool:
+        if self._last_applied is None:
+            return False
+        return self._snapshot() != self._last_applied
+
+    # ---------- notifications ----------
+
+    def _toast(self, message: str, timeout: float = 1.6) -> None:
+        notify = getattr(self, "notify", None)
+        if callable(notify):
+            try:
+                notify(message, timeout=timeout)
+                return
+            except TypeError:
+                try:
+                    notify(message)
+                    return
+                except Exception:
+                    pass
+
+        if self.selected:
+            self.query_one("#status", Static).update(f"[b]{self.selected}[/b]\n{message}")
+            self.set_timer(timeout, self.refresh_right)
+
+    # ---------- core refresh ----------
+
+    def refresh_right(self):
+        if not self.selected:
+            return
+
+        enabled = self.conf[self.selected]["enabled"]
+        mode = self.conf[self.selected]["mode"] or "auto"
+        pos = self.pos.get(self.selected)
+        pos_str = "none" if not pos else f"{pos[0]} {pos[1]}"
+        dirty_str = "  [yellow](unapplied changes)[/yellow]" if self._is_dirty() else ""
+
+        self.query_one("#status", Static).update(
+            f"[b]{self.selected}[/b]{dirty_str}    enabled={enabled}    mode={mode}    pos={pos_str}\n"
+            "Keys: e=toggle  m=mode  p=position  y/Enter=apply  q=quit  Esc=back"
+        )
+
+        cmd = build_cmd(self.conf, self.pos)
+        self.query_one("#cmd", TextArea).text = " ".join(shlex.quote(str(x)) for x in cmd)
+
+    # ---------- menu helpers ----------
+
+    def _menu_open(self) -> bool:
+        return bool(self.query_one("#menu", ListView).display)
+
+    def _render_menu_items(self, items: List[str]) -> None:
+        lv = self.query_one("#menu", ListView)
+        lv.clear()
+        for it in items:
+            lv.append(ListItem(Label(it)))
+
+    def _force_menu_highlight(self) -> None:
+        """Force a visible cursor highlight on older Textual versions."""
+        lv = self.query_one("#menu", ListView)
+        if not lv.display:
+            return
+        lv.focus()
+
+        if self.menu_items:
+            lv.index = 0
+            if hasattr(lv, "highlighted"):
+                try:
+                    lv.highlighted = 0  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+
+        try:
+            lv.refresh()
+        except Exception:
+            pass
+
+    def _open_menu(self, items: List[str]) -> None:
+        self.menu_items = list(items)
+        lv = self.query_one("#menu", ListView)
+        self._render_menu_items(self.menu_items)
+        lv.display = True
+
+        # Force highlight after the event loop tick so it actually paints.
+        self.call_later(self._force_menu_highlight)
+
+    def _close_menu(self) -> None:
+        lv = self.query_one("#menu", ListView)
+        lv.display = False
+        self.menu_kind = None
+        self.pending_rel = None
+        self.menu_items = []
+        self.action_focus_left()
+        self.refresh_right()
+
+    # ---------- navigation ----------
+
+    def action_focus_left(self):
+        self.query_one("#outlist", ListView).focus()
+        self.active_pane = "left"
+
+    def action_focus_right(self):
+        if self._menu_open():
+            self.query_one("#menu", ListView).focus()
+        else:
+            self.query_one("#cmd", TextArea).focus()
+        self.active_pane = "right"
+
+    def action_down(self):
+        if self._menu_open():
+            lv = self.query_one("#menu", ListView)
+            if lv.index is None:
+                lv.index = 0
+            else:
+                lv.index = min(lv.index + 1, len(lv.children) - 1)
+            if hasattr(lv, "highlighted"):
+                try:
+                    lv.highlighted = lv.index  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+            return
+
+        if self.active_pane == "left":
+            lv = self.query_one("#outlist", ListView)
+            if lv.index is None:
+                return
+            lv.index = min(lv.index + 1, len(self.available) - 1)
+            self.selected = self.available[lv.index]
+            self.refresh_right()
+
+    def action_up(self):
+        if self._menu_open():
+            lv = self.query_one("#menu", ListView)
+            if lv.index is None:
+                lv.index = 0
+            else:
+                lv.index = max(lv.index - 1, 0)
+            if hasattr(lv, "highlighted"):
+                try:
+                    lv.highlighted = lv.index  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+            return
+
+        if self.active_pane == "left":
+            lv = self.query_one("#outlist", ListView)
+            if lv.index is None:
+                return
+            lv.index = max(lv.index - 1, 0)
+            self.selected = self.available[lv.index]
+            self.refresh_right()
+
+    # ---------- actions ----------
+
+    def action_apply_now(self):
+        # If menu is open, Enter should select from menu, not apply.
+        if self._menu_open():
+            self._select_current_menu_item()
+            return
+
+        cmd = build_cmd(self.conf, self.pos)
+        rc = subprocess.call(cmd)
+        if rc == 0:
+            self._mark_applied_snapshot()
+            self._toast("Applied.")
+        else:
+            self._toast(f"Apply failed (exit code {rc}).")
+        self.refresh_right()
+
+    def action_toggle_enabled(self):
+        if not self.selected:
+            return
+        self.conf[self.selected]["enabled"] = not bool(self.conf[self.selected]["enabled"])
+        self.refresh_right()
+
+    def action_open_mode_menu(self):
+        if not self.selected:
+            return
+        self.menu_kind = "mode"
+        modes = self.outputs[self.selected]["modes"] or ["auto"]
+        self._open_menu(modes)
+
+    def action_open_pos_menu(self):
+        if not self.selected:
+            return
+        self.menu_kind = "pos_rel"
+        self.pending_rel = None
+        rels = ["none", "right-of", "left-of", "above", "below"]
+        self._open_menu(rels)
+
+    def action_close_menu(self):
+        self._close_menu()
+
+    def action_quit(self):
+        if self._is_dirty():
+            self.push_screen(ConfirmQuit())
+        else:
+            self.exit()
+
+    # ---------- menu selection ----------
+
+    def _select_current_menu_item(self) -> None:
+        """Select the currently highlighted menu item (works for Enter)."""
+        if not self._menu_open() or not self.menu_items or not self.selected:
+            return
+
+        lv = self.query_one("#menu", ListView)
+        idx = lv.index
+        if idx is None or idx < 0 or idx >= len(self.menu_items):
+            idx = 0
+
+        item_text = self.menu_items[idx]
+        self._handle_menu_choice(item_text)
+
+    def _handle_menu_choice(self, item_text: str) -> None:
+        """Apply the chosen menu item depending on menu_kind."""
+        if not self.selected:
+            return
+
+        if self.menu_kind == "mode":
+            self.conf[self.selected]["mode"] = None if item_text == "auto" else item_text
+            self._close_menu()
+            return
+
+        if self.menu_kind == "pos_rel":
+            if item_text == "none":
+                self.pos.pop(self.selected, None)
+                self._close_menu()
+                return
+
+            self.pending_rel = item_text
+            self.menu_kind = "pos_ref"
+            refs = [x for x in self.available if x != self.selected]
+            if not refs:
+                self._toast("No other output to position relative to.")
+                self._close_menu()
+                return
+
+            # Important: defer to avoid repaint issues
+            self.call_later(self._open_menu, refs)
+            return
+
+        if self.menu_kind == "pos_ref":
+            if self.pending_rel:
+                self.pos[self.selected] = (self.pending_rel, item_text)
+            self._close_menu()
+            return
+
+    # Mouse click selection still supported
+    def on_list_view_selected(self, e: ListView.Selected):
+        if e.list_view.id != "menu":
+            return
+        if not self._menu_open() or not self.menu_items:
+            return
+
+        # Make sure the highlight follows the click
+        lv = self.query_one("#menu", ListView)
+        lv.index = e.index
+        if hasattr(lv, "highlighted"):
+            try:
+                lv.highlighted = e.index  # type: ignore[attr-defined]
+            except Exception:
+                pass
+
+        if 0 <= e.index < len(self.menu_items):
+            self._handle_menu_choice(self.menu_items[e.index])
+
+
+if __name__ == "__main__":
+    TuiRandr().run()
+
